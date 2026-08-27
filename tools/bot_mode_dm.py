@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -62,6 +63,12 @@ MESSAGE_AGENT_TOOL_NAME = "message_agent"
 # runaway paste can't turn one DM into a context bomb on the recipient.
 MESSAGE_MAX_CHARS = 16000
 
+# Bound the recipient Bot turn itself.  The per-profile flock already bounds
+# how long a delivery may wait to START; this second budget prevents a wedged
+# provider/model call from holding that lock indefinitely after it starts.
+DELIVERY_TIMEOUT_SECONDS_FALLBACK = 180.0
+DELIVERY_TIMEOUT_SECONDS_MAX = 3600.0
+
 # A runner normally owns and removes each file. This bounds the residual
 # plaintext lifetime if the machine dies after background-spawn acknowledgement
 # but before the runner reaches its ``finally`` block.
@@ -70,6 +77,25 @@ _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def delivery_timeout_seconds() -> float:
+    """Return the configured wall-clock cap for one Bot DM recipient turn."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        raw = cfg_get(
+            load_config(),
+            "bot_mode",
+            "delivery_timeout_seconds",
+            default=DELIVERY_TIMEOUT_SECONDS_FALLBACK,
+        )
+        value = float(raw)
+        if math.isfinite(value) and 0 < value <= DELIVERY_TIMEOUT_SECONDS_MAX:
+            return value
+    except (TypeError, ValueError, OSError, RuntimeError):
+        pass
+    return DELIVERY_TIMEOUT_SECONDS_FALLBACK
 
 
 def message_agent_tool_schema() -> dict:
@@ -564,16 +590,23 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     """
     try:
         with _delivery_lock(argv, stdin_file=stdin_file):
+            timeout_seconds = delivery_timeout_seconds()
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
-                    return subprocess.run(argv, stdin=stream, check=False).returncode
+                    return subprocess.run(
+                        argv,
+                        stdin=stream,
+                        check=False,
+                        timeout=timeout_seconds,
+                    ).returncode
             proc = subprocess.run(
                 [*argv, "--query-file", dm_file],
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=timeout_seconds,
             )
             if proc.returncode != 0:
                 from tools.bot_failure_reasons import (
@@ -589,6 +622,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                         check=False,
                         capture_output=True,
                         text=True,
+                        timeout=timeout_seconds,
                     )
             # Re-emit the transport's streams: stdout is the reply text the
             # completion notification carries back to the sending agent.
@@ -708,6 +742,24 @@ def _delivery_main(args: list[str]) -> int:
     dm_file = args[2]
     try:
         return _run_delivery(args[3:], dm_file, stdin_file=stdin_file)
+    except subprocess.TimeoutExpired as exc:
+        from tools.bot_failure_reasons import DELIVERY_TIMEOUT
+
+        timeout_seconds = float(exc.timeout)
+        print(
+            json.dumps(
+                {
+                    "status": "BLOCKED",
+                    "reason": DELIVERY_TIMEOUT,
+                    "timeout_seconds": timeout_seconds,
+                    "error": (
+                        "Recipient Bot turn exceeded its bounded delivery timeout; "
+                        "the process was terminated and its turn lock released."
+                    ),
+                }
+            )
+        )
+        return 124
     except Exception as exc:
         # 'target_busy' extends the #93091 item-1 structured refusal enum:
         # the queued delivery gave up after its bounded wait — surface the

@@ -13,8 +13,11 @@ import fcntl
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -142,6 +145,70 @@ def test_turn_wait_seconds_reads_config(monkeypatch):
     assert bot_relay.turn_wait_seconds() == 7.0
 
 
+def test_delivery_timeout_seconds_reads_config(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"bot_mode": {"delivery_timeout_seconds": 41}},
+    )
+    assert bot_mode_dm.delivery_timeout_seconds() == 41.0
+
+
+def test_delivery_timeout_seconds_has_bounded_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {},
+    )
+    assert 30.0 <= bot_mode_dm.delivery_timeout_seconds() <= 300.0
+
+
+@pytest.mark.parametrize(
+    "raw", ["inf", float("inf"), "nan", float("nan"), "1e100", 1e100]
+)
+def test_delivery_timeout_seconds_rejects_non_finite_values(monkeypatch, raw):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"bot_mode": {"delivery_timeout_seconds": raw}},
+    )
+    assert bot_mode_dm.delivery_timeout_seconds() == float(
+        bot_mode_dm.DELIVERY_TIMEOUT_SECONDS_FALLBACK
+    )
+
+
+@pytest.mark.parametrize("bot_mode_value", ["invalid-section", ["invalid-section"], 7])
+def test_delivery_timeout_seconds_rejects_non_mapping_section(monkeypatch, bot_mode_value):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"bot_mode": bot_mode_value},
+    )
+    assert bot_mode_dm.delivery_timeout_seconds() == float(
+        bot_mode_dm.DELIVERY_TIMEOUT_SECONDS_FALLBACK
+    )
+
+
+def test_delivery_timeout_seconds_handles_non_mapping_section_in_fresh_process(tmp_path):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("bot_mode: invalid-section\n", encoding="utf-8")
+    script = """
+from tools.bot_mode_dm import delivery_timeout_seconds
+print(delivery_timeout_seconds())
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert float(proc.stdout.strip()) == float(
+        bot_mode_dm.DELIVERY_TIMEOUT_SECONDS_FALLBACK
+    )
+
+
 # ── wiring: local teammate delivery (tools/bot_mode_dm.py) ──────────────────
 
 
@@ -207,6 +274,33 @@ def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, cap
         release.set()
         t.join(timeout=5)
     assert not dm.exists(), "DM plaintext must be reclaimed even on refusal"
+
+
+def test_delivery_main_reports_delivery_timeout_and_reclaims_plaintext(
+    root, tmp_path, monkeypatch, capsys
+):
+    home = root / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "delivery_timeout_seconds", lambda: 0.25)
+    dm = tmp_path / "dm.txt"
+    dm.write_text("status callback", encoding="utf-8")
+
+    def _timeout(argv, **kwargs):
+        assert kwargs["timeout"] == 0.25
+        raise bot_mode_dm.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", _timeout)
+    rc = bot_mode_dm._delivery_main(
+        ["--run-delivery", "query-file", str(dm), "hermes", "-p", "ops", "chat"]
+    )
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["reason"] == "delivery_timeout"
+    assert payload["status"] == "BLOCKED"
+    assert payload["timeout_seconds"] == 0.25
+    assert not dm.exists(), "DM plaintext must be reclaimed after a timed-out turn"
 
 
 def test_peer_stdin_delivery_skips_local_lock(root, tmp_path, monkeypatch):

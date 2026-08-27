@@ -5231,25 +5231,66 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _gui_surface_toolsets(platform: str) -> set[str]:
-    """Toolsets that exist because of the CLIENT on the other end, not the host.
+def _profile_disabled_toolsets(cfg: dict | None = None) -> set[str]:
+    """Return profile-denied toolsets from a proven configuration source.
 
-    Both entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
-    platform would carry their schema for nothing — so this resolver is the one
-    gate that exposes them.
+    Environment-selected toolsets are a convenience override, not an
+    authorization override.  If the source cannot be proven, deny the GUI
+    surfaces whose injection is owned by this gateway while preserving
+    explicitly requested non-GUI toolsets.
+    """
+    try:
+        from hermes_cli.config import load_config, require_valid_user_config_source
 
-    ``platform`` is the SESSION's source (``session.create``'s ``source``
-    field), never a process env var. The desktop app is a client: it can be
-    driving a local, SSH, URL, or cloud backend, and only the local/SSH spawn
-    paths run with ``HERMES_DESKTOP=1``. Keying GUI capability off that env var
-    silently stripped every pane/browser tool from URL and cloud gateways while
-    the same backend told the model it was "chatting inside the Hermes desktop
-    app". See the surface-capability rule in AGENTS.md.
+        require_valid_user_config_source(mapping_sections=("agent",))
+        resolved_cfg = cfg if isinstance(cfg, dict) else load_config()
+    except Exception as exc:
+        logger.warning(
+            "Could not verify profile config; denying GUI surface toolsets: %s",
+            exc,
+        )
+        return {"project", "desktop_ui"}
+
+    agent_cfg = resolved_cfg.get("agent")
+    if agent_cfg is not None and not isinstance(agent_cfg, dict):
+        logger.warning(
+            "Profile agent config is not a mapping; denying GUI surface toolsets"
+        )
+        return {"project", "desktop_ui"}
+
+    from agent.skill_utils import parse_config_string_list
+
+    return {
+        str(item).strip()
+        for item in parse_config_string_list(
+            (agent_cfg or {}).get("disabled_toolsets")
+        )
+        if str(item).strip()
+    }
+
+
+def _gui_surface_toolsets(platform: str, cfg: dict | None = None) -> set[str]:
+    """Return client-provided toolsets that are not explicitly denied.
+
+    GUI surfaces are capabilities of the connected client, but a profile-level
+    ``agent.disabled_toolsets`` entry remains an authorization boundary.  Do
+    not re-introduce a denied surface after the configured toolsets have been
+    resolved — coordinator/read-only profiles rely on that least-privilege
+    guarantee.
+
+    ``load_config()`` intentionally falls back to defaults when a fresh process
+    cannot parse config.yaml.  That fallback loses the provenance needed to
+    prove GUI surfaces were not denied, so independently verify the raw source
+    before adding either surface.  A missing file is valid; malformed or
+    unreadable input fails closed to no GUI surfaces.
     """
     surfaces = {"project"}
     if platform == "desktop":
         surfaces.add("desktop_ui")
-    return surfaces
+    return surfaces - _profile_disabled_toolsets(cfg)
+
+
+_CONFIG_ERROR_SAFE_TOOLSETS = ("clarify", "todo")
 
 
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
@@ -5276,9 +5317,20 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
             if selection is not None:
                 # Fold in the client-surface toolsets here too: the focus-mode
                 # coding posture returns before the fallback path that normally
-                # adds them — without this the desktop loses its pane/project
-                # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                # adds them. Profile-level denials remain authoritative.
+                try:
+                    from hermes_cli.config import load_config
+
+                    cfg = load_config()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not load profile config; keeping coding posture without GUI surfaces: %s",
+                        exc,
+                    )
+                    return sorted(set(selection))
+                return sorted(
+                    {*selection, *_gui_surface_toolsets(session_platform, cfg)}
+                )
         except Exception:
             pass
 
@@ -5288,8 +5340,19 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         validate_toolset = None
 
     if explicit and validate_toolset is not None:
-        built_in = [name for name in explicit if validate_toolset(name)]
-        unresolved = [name for name in explicit if name not in built_in]
+        disabled_toolsets = _profile_disabled_toolsets()
+        denied_explicit = [name for name in explicit if name in disabled_toolsets]
+        authorized_explicit = [name for name in explicit if name not in disabled_toolsets]
+        built_in = [name for name in authorized_explicit if validate_toolset(name)]
+        unresolved = [name for name in authorized_explicit if name not in built_in]
+
+        if denied_explicit:
+            print(
+                "[tui] ignoring profile-disabled HERMES_TUI_TOOLSETS entries: "
+                f"{', '.join(denied_explicit)}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if unresolved:
             try:
@@ -5305,14 +5368,24 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 unresolved = [name for name in unresolved if name not in plugin_valid]
 
         if any(name in {"all", "*"} for name in built_in):
-            ignored = [name for name in explicit if name not in {"all", "*"}]
+            ignored = [
+                name for name in authorized_explicit if name not in {"all", "*"}
+            ]
             if ignored:
                 print(
-                    "[tui] HERMES_TUI_TOOLSETS=all enables every toolset; "
+                    "[tui] HERMES_TUI_TOOLSETS=all enables every non-disabled toolset; "
                     f"ignoring additional entries: {', '.join(ignored)}",
                     file=sys.stderr,
                     flush=True,
                 )
+            if disabled_toolsets:
+                from toolsets import get_toolset_names
+
+                return [
+                    name
+                    for name in get_toolset_names()
+                    if name not in disabled_toolsets
+                ]
             return None
 
         if not unresolved:
@@ -5395,15 +5468,19 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
-    except Exception:
+        return sorted(enabled | _gui_surface_toolsets(session_platform, cfg))
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve configured CLI toolsets; using safe toolsets without GUI surfaces: %s",
+            exc,
+        )
         if fallback_notice is not None:
             print(
-                "[tui] no valid HERMES_TUI_TOOLSETS entries and configured CLI toolsets could not be loaded; enabling all toolsets",
+                "[tui] no valid HERMES_TUI_TOOLSETS entries and configured CLI toolsets could not be loaded; using safe toolsets without GUI surfaces",
                 file=sys.stderr,
                 flush=True,
             )
-        return None
+        return list(_CONFIG_ERROR_SAFE_TOOLSETS)
 
 
 def _session_tool_progress_mode(sid: str) -> str:
@@ -7826,6 +7903,7 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        disabled_toolsets=sorted(_profile_disabled_toolsets()),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.

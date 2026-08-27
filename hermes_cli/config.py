@@ -3313,14 +3313,17 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def read_user_config_raw(
+    config_path: Optional[Path] = None, *, require_mapping: bool = False
+) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
     expansion, no migration, no root-model normalization, no caching.
 
-    ONLY legal for write-back round-trips and raw-file diagnostics —
-    behavioral reads must use load_config()/load_config_readonly().
+    ONLY legal for write-back round-trips, raw-file diagnostics, and the
+    centralized authorization-provenance guard below — behavioral reads must
+    use load_config()/load_config_readonly().
 
     Legal call sites, exhaustively:
 
@@ -3331,6 +3334,10 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
       * RAW-FILE DIAGNOSTICS (doctor, deprecation sweeps): these inspect
         what the user actually wrote — stale root keys, drift against .env —
         and merged defaults would produce false positives.
+      * AUTHORIZATION PROVENANCE (only through
+        ``require_valid_user_config_source``): callers enabling optional
+        capabilities must distinguish a proven source from defaults or a
+        last-known-good fallback after malformed input.
       * PRESENCE-SENSITIVE ENV BRIDGES (gateway/send bridges that only
         export a key when the user explicitly set it): a defaults merge
         would make every key "present" and bridge the entire DEFAULT_CONFIG
@@ -3346,7 +3353,9 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
       * unparseable YAML / other I/O errors → raises (callers that want
         fail-open already wrap in try/except; callers with last-known-good
         or warn semantics rely on the exception)
-      * non-dict YAML root → ``{}``
+      * non-dict YAML root → ``{}`` by default; with ``require_mapping=True``
+        it raises ``ValueError`` so authorization-sensitive callers can fail
+        closed instead of mistaking an invalid root for an empty config.
 
     ``config_path`` defaults to :func:`get_config_path` (profile-aware).
     Pass an explicit path when the caller resolves its own home (gateway
@@ -3356,10 +3365,43 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+            data = fast_safe_load(f)
     except FileNotFoundError:
         return {}
+    if data is None:
+        return {}
+    if require_mapping and not isinstance(data, dict):
+        raise ValueError(
+            f"Expected a mapping at the root of {config_path}, got {type(data).__name__}"
+        )
     return data if isinstance(data, dict) else {}
+
+
+def require_valid_user_config_source(
+    config_path: Optional[Path] = None, *, mapping_sections: Tuple[str, ...] = ()
+) -> Dict[str, Any]:
+    """Require a usable source for authorization-sensitive configuration.
+
+    ``load_config()`` may legitimately serve defaults or an in-process
+    last-known-good value after a source failure. Authorization-sensitive
+    callers that must distinguish those fallbacks from a proven source use
+    this guard before enabling optional capabilities.
+
+    The document root must be a mapping. Names passed in ``mapping_sections``
+    must also be mappings when present and non-null; this prevents a malformed
+    authorization-bearing section from being mistaken for an empty policy.
+    The validated raw mapping is returned for callers that also need to inspect
+    source provenance.
+    """
+    raw = read_user_config_raw(config_path, require_mapping=True)
+    for section in mapping_sections:
+        value = raw.get(section)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(
+                f"Expected config section {section!r} to be a mapping, "
+                f"got {type(value).__name__}"
+            )
+    return raw
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:

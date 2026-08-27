@@ -11,7 +11,7 @@ Canonical owners:
   * ``hermes_cli/config.py`` — ``load_config()`` / ``load_config_readonly()``
     (merged + managed + env-expanded), ``read_raw_config()`` and
     ``read_user_config_raw()`` (the ONLY legal raw primitives: write-back
-    round-trips + raw-file diagnostics).
+    round-trips, diagnostics, and centralized authorization provenance).
   * ``gateway/config.py`` — the gateway's ``load_gateway_config`` owner.
   * ``gateway/run.py`` — ``_load_gateway_config()``'s monkeypatched-home
     fallback path (delegates to ``read_raw_config`` when paths agree).
@@ -125,5 +125,15 @@ def test_read_user_config_raw_exists_and_documented():
     from hermes_cli.config import read_user_config_raw
 
     doc = read_user_config_raw.__doc__ or ""
-    assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
+    assert (
+        "ONLY legal for write-back round-trips, raw-file diagnostics, and the"
+        in doc
+    )
+    assert "authorization-provenance guard" in doc
     assert "load_config()" in doc
+
+    from hermes_cli.config import require_valid_user_config_source
+
+    guard_doc = require_valid_user_config_source.__doc__ or ""
+    assert "authorization-sensitive" in guard_doc
+    assert "mapping_sections" in guard_doc

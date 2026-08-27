@@ -2448,6 +2448,68 @@ def test_load_enabled_toolsets_accepts_plugin_env_after_discovery(monkeypatch):
     assert server._load_enabled_toolsets() == ["plugin_demo"]
 
 
+@pytest.mark.parametrize(
+    ("explicit", "disabled", "denied_tools"),
+    [
+        ("project,desktop_ui", ["project", "desktop_ui"], []),
+        ("all", ["project", "desktop_ui"], []),
+        ("web,terminal", ["web"], ["web_search", "web_extract"]),
+        ("all", ["web"], ["web_search", "web_extract"]),
+        ("coding", ["terminal"], ["terminal", "process"]),
+    ],
+)
+def test_load_enabled_toolsets_env_never_bypasses_disabled_toolsets_in_fresh_process(
+    tmp_path, explicit, disabled, denied_tools
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        json.dumps({"agent": {"disabled_toolsets": disabled}}),
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "result.json"
+    script = """
+import json
+import os
+from pathlib import Path
+from model_tools import get_tool_definitions
+from tui_gateway import server
+
+selected = server._load_enabled_toolsets("desktop")
+disabled = sorted(server._profile_disabled_toolsets())
+definitions = get_tool_definitions(
+    enabled_toolsets=selected,
+    disabled_toolsets=disabled,
+    quiet_mode=True,
+)
+result = {
+    "selected": selected,
+    "tools": sorted(item["function"]["name"] for item in definitions),
+}
+Path(os.environ["HERMES_TEST_RESULT"]).write_text(
+    json.dumps(result), encoding="utf-8"
+)
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_TEST_RESULT"] = str(result_path)
+    env["HERMES_TUI_TOOLSETS"] = explicit
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["selected"] is not None
+    assert set(disabled).isdisjoint(result["selected"])
+    assert set(denied_tools).isdisjoint(result["tools"])
+
+
 def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     # Focus-mode coding posture returns before the config fallback, but it's
     # still a GUI-only resolver — `project` must come along so the desktop keeps
@@ -2459,6 +2521,158 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding", "figma"])
 
     assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
+
+
+def test_load_enabled_toolsets_honors_disabled_gui_surfaces_in_focus_posture(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["clarify", "todo"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"agent": {"disabled_toolsets": ["project", "desktop_ui"]}},
+    )
+
+    result = server._load_enabled_toolsets("desktop")
+    assert result == ["clarify", "todo"]
+
+
+def test_load_enabled_toolsets_honors_json_string_disabled_gui_surfaces(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["clarify", "todo"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"agent": {"disabled_toolsets": '["project", "desktop_ui"]'}},
+    )
+
+    result = server._load_enabled_toolsets("desktop")
+    assert result == ["clarify", "todo"]
+
+
+def test_load_enabled_toolsets_fails_closed_when_config_is_unavailable(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["clarify", "todo"])
+
+    def _unavailable():
+        raise RuntimeError("synthetic config failure")
+
+    monkeypatch.setattr(config_mod, "load_config", _unavailable)
+
+    result = server._load_enabled_toolsets("desktop")
+    assert result == ["clarify", "todo"]
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    ["invalid: yaml: [[[bad", "- valid-yaml-but-not-a-mapping"],
+)
+def test_load_enabled_toolsets_fails_closed_for_malformed_config_in_fresh_process(
+    tmp_path, config_text
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(config_text, encoding="utf-8")
+    result_path = tmp_path / "result.json"
+    script = """
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+from tui_gateway import server
+
+with patch(
+    "agent.coding_context.coding_selection",
+    return_value=["clarify", "todo"],
+):
+    result = server._load_enabled_toolsets("desktop")
+Path(os.environ["HERMES_TEST_RESULT"]).write_text(json.dumps(result), encoding="utf-8")
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_TEST_RESULT"] = str(result_path)
+    env.pop("HERMES_TUI_TOOLSETS", None)
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert json.loads(result_path.read_text(encoding="utf-8")) == ["clarify", "todo"]
+
+
+@pytest.mark.parametrize("agent_value", ["invalid-section", ["invalid-section"]])
+def test_load_enabled_toolsets_never_enables_all_for_invalid_agent_section(
+    tmp_path, agent_value
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    config_text = json.dumps({"agent": agent_value})
+    (home / "config.yaml").write_text(config_text, encoding="utf-8")
+    result_path = tmp_path / "result.json"
+    script = """
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+from tui_gateway import server
+
+with patch("agent.coding_context.coding_selection", return_value=None):
+    result = server._load_enabled_toolsets("desktop")
+Path(os.environ["HERMES_TEST_RESULT"]).write_text(json.dumps(result), encoding="utf-8")
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_TEST_RESULT"] = str(result_path)
+    env.pop("HERMES_TUI_TOOLSETS", None)
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert json.loads(result_path.read_text(encoding="utf-8")) == ["clarify", "todo"]
+
+
+def test_load_enabled_toolsets_honors_disabled_gui_surfaces_in_config_fallback(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: None)
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "agent": {"disabled_toolsets": ["project", "desktop_ui"]},
+            "platform_toolsets": {"cli": ["clarify", "todo"]},
+        },
+    )
+
+    result = server._load_enabled_toolsets("desktop")
+    assert result is not None
+    assert "project" not in result
+    assert "desktop_ui" not in result
 
 
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
@@ -2487,10 +2701,11 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     # back-filled onto saved lists that never offered them — allow those too.
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
-    result = server._load_enabled_toolsets()
+    result = server._load_enabled_toolsets("tui")
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    expected = {"kanban", "memory", "project"}
+    assert expected <= set(result)
+    assert set(result) - expected <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2513,10 +2728,11 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
 
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
-    result = server._load_enabled_toolsets()
+    result = server._load_enabled_toolsets("tui")
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    expected = {"kanban", "memory", "project"}
+    assert expected <= set(result)
+    assert set(result) - expected <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -2534,8 +2750,10 @@ def test_load_enabled_toolsets_warns_when_config_fallback_fails(monkeypatch, cap
         config_mod, "load_config", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
     )
 
-    assert server._load_enabled_toolsets() is None
-    assert "could not be loaded" in capsys.readouterr().err
+    assert server._load_enabled_toolsets() == ["clarify", "todo"]
+    err = capsys.readouterr().err
+    assert "could not be loaded" in err
+    assert "using safe toolsets without GUI surfaces" in err
 
 
 def test_load_enabled_toolsets_honors_builtin_env_if_config_fails(monkeypatch):
@@ -4397,6 +4615,7 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     )
     monkeypatch.setattr("run_agent.AIAgent", fake_agent)
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
+    monkeypatch.setattr(server, "_profile_disabled_toolsets", lambda: {"terminal"})
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     agent = server._make_agent("sid", "session-key")
@@ -4404,6 +4623,7 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     assert agent.model == "gpt-5.5"
     assert captured["fallback_model"] == fallback_chain
     assert captured["platform"] == "tui"
+    assert captured["disabled_toolsets"] == ["terminal"]
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
