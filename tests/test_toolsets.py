@@ -63,6 +63,16 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_file_readonly_excludes_mutation_tools(self):
+        tools = set(resolve_toolset("file_readonly"))
+        assert tools == {"read_file", "search_files"}
+        assert tools.isdisjoint({"write_file", "patch"})
+
+    def test_skills_readonly_excludes_skill_management(self):
+        tools = set(resolve_toolset("skills_readonly"))
+        assert tools == {"skills_list", "skill_view"}
+        assert "skill_manage" not in tools
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools
@@ -192,6 +202,12 @@ class TestRegistryOwnedToolsets:
 
 class TestToolsetConsistency:
     """Verify structural integrity of the built-in TOOLSETS dict."""
+
+    def test_readonly_toolsets_are_cli_configurable(self):
+        from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS
+
+        configurable = {name for name, _label, _description in CONFIGURABLE_TOOLSETS}
+        assert {"file_readonly", "skills_readonly"}.issubset(configurable)
 
     def test_all_toolsets_have_required_keys(self):
         for name, ts in TOOLSETS.items():
